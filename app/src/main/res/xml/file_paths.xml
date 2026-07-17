@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<paths>
+    <cache-path name="shared_apps" path="shared_apps/" />
+    <external-cache-path name="shared_apps_external" path="shared_apps/" />
+</paths>
