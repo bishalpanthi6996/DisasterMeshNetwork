@@ -23,6 +23,8 @@ class BluetoothManagerHelper(
 
     val nearbyDevices = mutableStateListOf<Pair<String, String>>()
 
+    var onDeviceFound: ((String, String) -> Unit)? = null
+
     private var receiverRegistered = false
 
     private val bluetoothReceiver = object : BroadcastReceiver() {
@@ -59,6 +61,7 @@ class BluetoothManagerHelper(
                         val address = device.address
 
                         addDevice(name, address)
+                        onDeviceFound?.invoke(name, address)
 
                         Log.d("BluetoothDiscovery", "Found: $name ($address)")
                     }

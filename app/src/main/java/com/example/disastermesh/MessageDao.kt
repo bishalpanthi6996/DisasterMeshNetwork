@@ -29,6 +29,9 @@ interface MessageDao {
     @Query("UPDATE messages SET isCloudSynced = :isSynced WHERE messageId = :msgId")
     suspend fun updateSyncStatus(msgId: String, isSynced: Boolean)
 
+    @Query("UPDATE messages SET latitude = :lat, longitude = :lon WHERE messageId = :msgId")
+    suspend fun updateMessageLocation(msgId: String, lat: Double, lon: Double)
+
     @Query("DELETE FROM messages")
     suspend fun deleteAllMessages()
 

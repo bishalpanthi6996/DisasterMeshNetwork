@@ -21,6 +21,7 @@ class BluetoothConnectionManager(private val context: Context) {
     
     private var serverJob: Job? = null
     private var isListening = false
+    private val connectedAddresses = mutableSetOf<String>()
 
     @SuppressLint("MissingPermission")
     fun listen() {
@@ -54,6 +55,9 @@ class BluetoothConnectionManager(private val context: Context) {
 
     @SuppressLint("MissingPermission")
     fun connect(address: String) {
+        if (connectedAddresses.contains(address)) return
+        connectedAddresses.add(address)
+
         CoroutineScope(Dispatchers.IO).launch {
             val device = bluetoothAdapter?.getRemoteDevice(address)
             var socket: BluetoothSocket? = null
@@ -69,6 +73,7 @@ class BluetoothConnectionManager(private val context: Context) {
                 }
             } catch (e: IOException) {
                 Log.e("MeshNetwork", "Connection failed: ${e.message}")
+                connectedAddresses.remove(address) // Allow retry later
                 try { socket?.close() } catch (e2: Exception) {}
             }
         }

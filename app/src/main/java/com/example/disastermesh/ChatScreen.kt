@@ -411,8 +411,13 @@ fun ChatBubble(
                         val icon = if (msg.type == "SOS") Icons.Default.Warning else Icons.Default.Mic
                         Icon(icon, null, tint = Color.White, modifier = Modifier.size(16.dp))
                         
-                        // Generate a consistent numeric ID from the UUID hash
-                        val numericId = Math.abs(msg.messageId.hashCode() % 100000).toString().padStart(5, '0')
+                        // Preserve the identical numeric ID from the mesh
+                        val numericId = if (msg.messageId.startsWith("BEACON-")) {
+                            msg.messageId.removePrefix("BEACON-")
+                        } else {
+                            Math.abs(msg.messageId.hashCode() % 100000).toString().padStart(5, '0')
+                        }
+
                         val label = if (msg.type == "SOS") "SOS" else "VOICE"
                         val triage = if (msg.type == "SOS") " | LEVEL: ${msg.triageLevel}" else ""
                         
@@ -441,10 +446,11 @@ fun ChatBubble(
                                 onClick = { onLocationClick(msg.latitude, msg.longitude) },
                                 modifier = Modifier.size(32.dp)
                             ) {
+                                val isRecent = System.currentTimeMillis() - msg.timestamp < 60000
                                 Icon(
-                                    imageVector = Icons.Default.Map,
+                                    imageVector = if (msg.type == "SOS" && isRecent) Icons.Default.GpsFixed else Icons.Default.Map,
                                     contentDescription = "See on Map",
-                                    tint = contentColor,
+                                    tint = if (msg.type == "SOS" && isRecent) Color.Green else contentColor,
                                     modifier = Modifier.size(20.dp)
                                 )
                             }

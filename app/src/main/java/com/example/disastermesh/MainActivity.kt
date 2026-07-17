@@ -1,6 +1,7 @@
 package com.example.disastermesh
 
 import android.Manifest
+import android.annotation.SuppressLint
 import android.bluetooth.BluetoothAdapter
 import android.bluetooth.BluetoothManager
 import android.hardware.Sensor
@@ -9,9 +10,11 @@ import android.hardware.SensorEventListener
 import android.hardware.SensorManager
 import kotlin.math.sqrt
 import android.content.Context
+import android.util.Log
 import android.location.LocationManager
+import com.google.android.gms.location.LocationServices
+import com.google.android.gms.location.Priority
 import android.provider.Settings
-import androidx.compose.ui.text.style.TextDecoration
 import androidx.compose.material.icons.filled.Bluetooth
 import androidx.compose.material.icons.filled.Mic
 import androidx.compose.material.icons.filled.GpsFixed
@@ -36,6 +39,7 @@ import androidx.compose.ui.graphics.drawscope.clipPath
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.graphicsLayer
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.tasks.await
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
@@ -62,6 +66,7 @@ import com.example.disastermesh.ui.theme.DisasterMeshTheme
 
 class MainActivity : ComponentActivity() {
     private lateinit var bluetoothHelper: BluetoothManagerHelper
+    private lateinit var bleManager: BLEManager
     private lateinit var bluetoothConnectionManager: BluetoothConnectionManager
     private lateinit var database: MessageDatabase
     private lateinit var repository: MessageRepository
@@ -111,6 +116,7 @@ class MainActivity : ComponentActivity() {
         repository = MessageRepository(database.messageDao())
 
         bluetoothHelper = BluetoothManagerHelper(this)
+        bleManager = BLEManager(this)
         bluetoothConnectionManager = BluetoothConnectionManager(this)
         
         enableEdgeToEdge()
@@ -126,6 +132,56 @@ class MainActivity : ComponentActivity() {
             // Hybrid Network Monitoring (Bluetooth + Mobile Network)
             LaunchedEffect(Unit) {
                 viewModel.startNetworkMonitoring(context)
+            }
+
+            // BLE Mesh Beacon Logic (Zero-Pairing Instant Discovery & RELAY)
+            LaunchedEffect(showStatusPopup) {
+                if (!showStatusPopup && allRequirementsMet()) {
+                    bleManager.startMeshScanning()
+                }
+                bleManager.onSosDetected = { id, lat, lon, triage, vCount ->
+                    // This creates the SOS in the database INSTANTLY
+                    viewModel.handleBleSosDetection(id, lat, lon, triage, vCount) {
+                        // Relay it with the EXACT SAME ID and VICTIM COUNT to the next hop
+                        bleManager.startSosBroadcast(id, lat, lon, triage, vCount, isRelay = true)
+                    }
+                }
+            }
+
+            // Sync BLE Broadcast with local SOS state (Original Source)
+            LaunchedEffect(viewModel.activeUserSosId) {
+                val sosId = viewModel.activeUserSosId
+                if (sosId != null) {
+                    val activeSos = repository.getActiveUserSos()
+                    val fusedLocationClient = LocationServices.getFusedLocationProviderClient(context)
+                    @SuppressLint("MissingPermission")
+                    fusedLocationClient.lastLocation.addOnSuccessListener { lastLoc ->
+                        if (lastLoc != null) {
+                            // Start shouting our SOS with our specific victim count
+                            bleManager.startSosBroadcast(
+                                sosId = sosId,
+                                lat = lastLoc.latitude,
+                                lon = lastLoc.longitude,
+                                triage = activeSos?.triageLevel ?: "CRITICAL",
+                                vCount = activeSos?.victimCount ?: 1
+                            )
+                        }
+                    }
+                } else {
+                    bleManager.stopSosBroadcast()
+                }
+            }
+
+            // Automatic Mesh Sync Logic (Classic Bluetooth Discovery used for Node Counting)
+            LaunchedEffect(Unit) {
+                while(true) {
+                    if (bluetoothHelper.bluetoothAdapter?.isEnabled == true) {
+                        bluetoothHelper.startDiscovery()
+                        // Update BLE Manager with latest nearby node count for relay decisions
+                        bleManager.updateNearbyNodeCount(bluetoothHelper.nearbyDevices.size)
+                    }
+                    delay(15000) // Scan every 15 seconds
+                }
             }
 
             // Periodic check for hardware status
@@ -149,7 +205,11 @@ class MainActivity : ComponentActivity() {
                     val manager = BluetoothChatManager(socket)
                     chatManager = manager
                     viewModel.syncHistory(manager)
-                    currentScreen = "chat"
+                    
+                    // Only jump to chat if we are on dashboard or nearby screen (user likely wants to see)
+                    if (currentScreen == "dashboard" || currentScreen == "nearby") {
+                        currentScreen = "chat"
+                    }
                 }
             }
             
@@ -709,7 +769,6 @@ fun DashboardScreen(
                 horizontalArrangement = Arrangement.Center
             ) {
                 val mode = "EARTHQUAKE"
-                val isSelected = viewModel.currentEmergencyMode == mode
                 Button(
                     onClick = { viewModel.currentEmergencyMode = mode },
                     modifier = Modifier.fillMaxWidth(0.6f),
@@ -887,19 +946,6 @@ fun TacticalBackground() {
             strokeWidth = 4f
         )
     }
-}
-
-@Composable
-fun TypingText(text: String, style: androidx.compose.ui.text.TextStyle) {
-    var visibleText by remember { mutableStateOf("") }
-    LaunchedEffect(text) {
-        visibleText = ""
-        text.forEach { char ->
-            visibleText += char
-            delay(50)
-        }
-    }
-    Text(text = visibleText, style = style)
 }
 
 @Composable

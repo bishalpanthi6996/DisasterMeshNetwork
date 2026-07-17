@@ -30,6 +30,10 @@ class MessageRepository(private val messageDao: MessageDao) {
         messageDao.updateSyncStatus(msgId, isSynced)
     }
 
+    suspend fun updateMessageLocation(msgId: String, lat: Double, lon: Double) {
+        messageDao.updateMessageLocation(msgId, lat, lon)
+    }
+
     suspend fun deleteAllMessages() {
         messageDao.deleteAllMessages()
     }
