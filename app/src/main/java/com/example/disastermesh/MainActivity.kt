@@ -71,7 +71,7 @@ class MainActivity : ComponentActivity() {
     private lateinit var database: MessageDatabase
     private lateinit var repository: MessageRepository
     
-    private var chatManager by mutableStateOf<BluetoothChatManager?>(null)
+    private val chatManagers = mutableStateListOf<BluetoothChatManager>()
     private var currentScreen by mutableStateOf("dashboard")
     private var showPermissionIntro by mutableStateOf(false)
     private var showStatusPopup by mutableStateOf(false)
@@ -97,6 +97,7 @@ class MainActivity : ComponentActivity() {
                 showPermissionIntro = false
                 bluetoothConnectionManager.listen()
                 ensureDiscoverable()
+                startMeshService()
             } else {
                 Toast.makeText(this, "Permissions Required for Mesh Protocol", Toast.LENGTH_LONG).show()
                 showPermissionIntro = true
@@ -135,8 +136,9 @@ class MainActivity : ComponentActivity() {
             }
 
             // BLE Mesh Beacon Logic (Zero-Pairing Instant Discovery & RELAY)
-            LaunchedEffect(showStatusPopup) {
-                if (!showStatusPopup && allRequirementsMet()) {
+            LaunchedEffect(Unit) {
+                // Ensure scanning is ALWAYS on, even during simulation
+                if (allRequirementsMet()) {
                     bleManager.startMeshScanning()
                 }
                 bleManager.onSosDetected = { id, lat, lon, triage, vCount ->
@@ -148,27 +150,54 @@ class MainActivity : ComponentActivity() {
                 }
             }
 
-            // Sync BLE Broadcast with local SOS state (Original Source)
+            // Sync BLE Broadcast with local SOS state (Original Source + Global Resolution)
             LaunchedEffect(viewModel.activeUserSosId) {
                 val sosId = viewModel.activeUserSosId
-                if (sosId != null) {
-                    val activeSos = repository.getActiveUserSos()
-                    val fusedLocationClient = LocationServices.getFusedLocationProviderClient(context)
-                    @SuppressLint("MissingPermission")
-                    fusedLocationClient.lastLocation.addOnSuccessListener { lastLoc ->
-                        if (lastLoc != null) {
-                            // Start shouting our SOS with our specific victim count
-                            bleManager.startSosBroadcast(
-                                sosId = sosId,
-                                lat = lastLoc.latitude,
-                                lon = lastLoc.longitude,
-                                triage = activeSos?.triageLevel ?: "CRITICAL",
-                                vCount = activeSos?.victimCount ?: 1
-                            )
-                        }
-                    }
-                } else {
+                if (sosId == null) {
                     bleManager.stopSosBroadcast()
+                    return@LaunchedEffect
+                }
+
+                // Periodically check status and update broadcast
+                while(true) {
+                    val mySos = repository.getMessageById(sosId)
+                    if (mySos == null) {
+                        viewModel.activeUserSosId = null
+                        bleManager.stopSosBroadcast()
+                        break
+                    }
+
+                    if (mySos.status == "ACTIVE") {
+                        val fusedLocationClient = LocationServices.getFusedLocationProviderClient(context)
+                        @SuppressLint("MissingPermission")
+                        fusedLocationClient.lastLocation.addOnSuccessListener { lastLoc ->
+                            if (lastLoc != null) {
+                                bleManager.startSosBroadcast(
+                                    sosId = sosId,
+                                    lat = lastLoc.latitude,
+                                    lon = lastLoc.longitude,
+                                    triage = mySos.triageLevel,
+                                    vCount = mySos.victimCount
+                                )
+                            }
+                        }
+                    } else {
+                        // User Rescued or Cancelled -> Broadcast RESOLVED to clear other devices
+                        Log.d("MeshCleanup", "Broadcasting RESOLVED for $sosId")
+                        bleManager.startSosBroadcast(
+                            sosId = sosId,
+                            lat = mySos.latitude ?: 0.0,
+                            lon = mySos.longitude ?: 0.0,
+                            triage = "RESOLVED",
+                            vCount = mySos.victimCount
+                        )
+                        delay(20000) // Burst for 20 seconds
+                        viewModel.finalizeSosRemoval()
+                        break
+                    }
+                    // Wait for 5 seconds OR until status changes (simulated by faster loop)
+                    // Reducing delay from 30s to 5s makes it much more responsive
+                    delay(5000)
                 }
             }
 
@@ -202,8 +231,10 @@ class MainActivity : ComponentActivity() {
 
             LaunchedEffect(Unit) {
                 bluetoothConnectionManager.onConnected = { socket ->
-                    val manager = BluetoothChatManager(socket)
-                    chatManager = manager
+                    val manager = BluetoothChatManager(socket) { disconnectedManager ->
+                        chatManagers.remove(disconnectedManager)
+                    }
+                    chatManagers.add(manager)
                     viewModel.syncHistory(manager)
                     
                     // Only jump to chat if we are on dashboard or nearby screen (user likely wants to see)
@@ -247,19 +278,9 @@ class MainActivity : ComponentActivity() {
 
             LaunchedEffect(viewModel.isSafetyCheckActive) {
                 if (viewModel.isSafetyCheckActive) {
-                    var elapsedSeconds = 0
                     while (viewModel.isSafetyCheckActive) {
                         haptic.performHapticFeedback(HapticFeedbackType.LongPress)
-                        
-                        // After 6 intervals (30 seconds), auto-broadcast SOS
-                        if (elapsedSeconds >= 30) {
-                            viewModel.sendSos(context, chatManager, "AUTO-SOS: No user response after disaster alert.")
-                            viewModel.confirmSafety() // Close overlay
-                            break
-                        }
-                        
-                        delay(5000) // Repeat every 5 seconds
-                        elapsedSeconds += 5
+                        delay(2000) // Haptic heartbeat every 2 seconds
                     }
                 }
             }
@@ -339,16 +360,16 @@ class MainActivity : ComponentActivity() {
                                 when (currentScreen) {
                                     "dashboard" -> DashboardScreen(
                                         viewModel = viewModel,
+                                        chatManagers = chatManagers,
                                         onSendSOSClick = { currentScreen = "emergency" },
                                         onResourceClick = { currentScreen = "resources" },
-                                        onIdentityClick = { currentScreen = "identity" },
                                         onShareAppClick = { AppSharingUtils.shareApp(this@MainActivity) }
                                     )
                                     "identity" -> IdentityScreen(
                                         viewModel = viewModel,
                                         onBack = { currentScreen = "dashboard" }
                                     )
-                                    "emergency" -> EmergencyScreen(viewModel, chatManager)
+                                    "emergency" -> EmergencyScreen(viewModel, chatManagers)
                                     "nearby" -> NearbyDevicesScreen(
                                         bluetoothHelper = bluetoothHelper,
                                         onConnectClick = { address ->
@@ -356,7 +377,7 @@ class MainActivity : ComponentActivity() {
                                         }
                                     )
                                     "chat" -> ChatScreen(
-                                        chatManager = chatManager,
+                                        chatManagers = chatManagers,
                                         viewModel = viewModel,
                                         modifier = Modifier.fillMaxSize(),
                                         onLocationClick = { lat, lon ->
@@ -365,16 +386,16 @@ class MainActivity : ComponentActivity() {
                                         }
                                     )
                                     "map" -> MapScreen(viewModel)
-                                    "resources" -> ResourceScreen(viewModel, chatManager)
+                                    "resources" -> ResourceScreen(viewModel, chatManagers)
                                     "guide" -> SurvivalGuideScreen()
                                 }
 
                                 if (viewModel.isSafetyCheckActive) {
                                     SafetyCheckOverlay(
-                                        onSafeClick = { viewModel.confirmSafety() },
+                                        disasterName = viewModel.activeDisasterAlert?.name ?: "EARTHQUAKE",
+                                        onSafeClick = { viewModel.confirmSafety(context, true, chatManagers) },
                                         onSosClick = {
-                                            viewModel.confirmSafety()
-                                            currentScreen = "emergency"
+                                            viewModel.confirmSafety(context, false, chatManagers)
                                         }
                                     )
                                 }
@@ -417,6 +438,16 @@ class MainActivity : ComponentActivity() {
             showPermissionIntro = false
             bluetoothConnectionManager.listen()
             ensureDiscoverable()
+            startMeshService()
+        }
+    }
+
+    private fun startMeshService() {
+        val intent = Intent(this, MeshService::class.java)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            startForegroundService(intent)
+        } else {
+            startService(intent)
         }
     }
 
@@ -557,11 +588,22 @@ fun RequirementItem(text: String, isOn: Boolean, icon: ImageVector) {
 }
 
 @Composable
-fun SafetyCheckOverlay(onSafeClick: () -> Unit, onSosClick: () -> Unit) {
+fun SafetyCheckOverlay(disasterName: String, onSafeClick: () -> Unit, onSosClick: () -> Unit) {
+    var timeLeft by remember { mutableIntStateOf(30) }
+    
+    LaunchedEffect(Unit) {
+        while(timeLeft > 0) {
+            delay(1000)
+            timeLeft--
+        }
+        // Auto-SOS if timer reaches zero
+        onSosClick()
+    }
+
     Box(
         modifier = Modifier
             .fillMaxSize()
-            .background(Color.Red.copy(alpha = 0.9f))
+            .background(Color.Red.copy(alpha = 0.95f))
             .padding(24.dp),
         contentAlignment = Alignment.Center
     ) {
@@ -572,39 +614,62 @@ fun SafetyCheckOverlay(onSafeClick: () -> Unit, onSosClick: () -> Unit) {
             Icon(
                 Icons.Default.Warning,
                 contentDescription = null,
-                modifier = Modifier.size(100.dp),
+                modifier = Modifier.size(120.dp),
                 tint = Color.White
             )
             Spacer(modifier = Modifier.height(24.dp))
             Text(
-                "DISASTER ALERT DETECTED",
+                "GOVERNMENT $disasterName ALERT",
                 style = MaterialTheme.typography.headlineLarge,
                 fontWeight = FontWeight.Black,
                 color = Color.White,
                 textAlign = TextAlign.Center
             )
             Text(
-                "Are you safe? The system will broadcast an SOS if you do not respond.",
-                style = MaterialTheme.typography.bodyLarge,
+                "YOU ARE IN THE IMPACT ZONE",
+                style = MaterialTheme.typography.titleMedium,
                 color = Color.White,
-                textAlign = TextAlign.Center
+                fontWeight = FontWeight.Bold
             )
+            
+            Spacer(modifier = Modifier.height(16.dp))
+            
+            CircularProgressIndicator(
+                progress = { timeLeft / 30f },
+                modifier = Modifier.size(80.dp),
+                color = Color.White,
+                strokeWidth = 8.dp,
+                trackColor = Color.White.copy(alpha = 0.3f)
+            )
+            
+            Text(
+                "Auto-SOS in ${timeLeft}s",
+                style = MaterialTheme.typography.headlineSmall,
+                color = Color.White,
+                fontWeight = FontWeight.Black
+            )
+
             Spacer(modifier = Modifier.height(48.dp))
+            
             Button(
                 onClick = onSafeClick,
-                modifier = Modifier.fillMaxWidth().height(64.dp),
-                colors = ButtonDefaults.buttonColors(containerColor = Color.White, contentColor = Color.Red)
+                modifier = Modifier.fillMaxWidth().height(70.dp),
+                colors = ButtonDefaults.buttonColors(containerColor = Color.White, contentColor = Color.Red),
+                shape = MaterialTheme.shapes.medium
             ) {
-                Text("I AM SAFE", fontWeight = FontWeight.Black, fontSize = 18.sp)
+                Text("I AM SAFE ✅", fontWeight = FontWeight.Black, fontSize = 20.sp)
             }
+            
             Spacer(modifier = Modifier.height(16.dp))
+            
             OutlinedButton(
                 onClick = onSosClick,
-                modifier = Modifier.fillMaxWidth().height(64.dp),
+                modifier = Modifier.fillMaxWidth().height(70.dp),
                 colors = ButtonDefaults.outlinedButtonColors(contentColor = Color.White),
-                border = androidx.compose.foundation.BorderStroke(2.dp, Color.White)
+                border = androidx.compose.foundation.BorderStroke(3.dp, Color.White),
+                shape = MaterialTheme.shapes.medium
             ) {
-                Text("SEND SOS NOW", fontWeight = FontWeight.Bold)
+                Text("I AM IN RISK! 🚨", fontWeight = FontWeight.Black, fontSize = 20.sp)
             }
         }
     }
@@ -719,15 +784,16 @@ fun IdentityScreen(viewModel: ChatViewModel, onBack: () -> Unit) {
 @Composable
 fun DashboardScreen(
     viewModel: ChatViewModel,
+    chatManagers: List<BluetoothChatManager>,
     onSendSOSClick: () -> Unit,
     onResourceClick: () -> Unit,
-    onIdentityClick: () -> Unit,
     onShareAppClick: () -> Unit
 ) {
     val scrollState = rememberScrollState()
     val messages by viewModel.allMessages.collectAsState()
     val activeSOSCount = messages.count { it.type == "SOS" && it.status == "ACTIVE" && it.timestamp > System.currentTimeMillis() - 3600000 }
     val haptic = LocalHapticFeedback.current
+    val context = LocalContext.current
 
     // Pulsing Animation for SOS
     val infiniteTransition = rememberInfiniteTransition(label = "pulse")
@@ -863,12 +929,14 @@ fun DashboardScreen(
             )
             
             DashboardButton(
-                text = "Identify",
-                subText = "Profile & Official Credentials",
-                icon = Icons.Default.Badge,
+                text = "Simulate Govt Alert",
+                subText = "TEST: Proactive Safety Check",
+                icon = Icons.Default.GppMaybe,
                 onClick = {
-                    haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
-                    onIdentityClick()
+                    haptic.performHapticFeedback(HapticFeedbackType.LongPress)
+                    // Mock receiving a disaster feed from the government
+                    viewModel.activeDisasterAlert = DisasterFeed("SIM_001", "EARTHQUAKE", 0.0, 0.0, 50.0)
+                    viewModel.isSafetyCheckActive = true
                 }
             )
 
@@ -888,7 +956,7 @@ fun DashboardScreen(
                 icon = Icons.Default.DeleteForever,
                 onClick = {
                     haptic.performHapticFeedback(HapticFeedbackType.LongPress)
-                    viewModel.clearAllData()
+                    viewModel.clearAllData(context, chatManagers)
                 }
             )
 
@@ -1017,5 +1085,17 @@ fun DashboardButton(
                 tint = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.2f)
             )
         }
+    }
+}
+
+@Preview(showBackground = true)
+@Composable
+fun SafetyCheckOverlayPreview() {
+    MaterialTheme {
+        SafetyCheckOverlay(
+            disasterName = "EARTHQUAKE",
+            onSafeClick = {},
+            onSosClick = {}
+        )
     }
 }

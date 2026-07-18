@@ -39,7 +39,7 @@ import java.io.FileOutputStream
 
 @Composable
 fun ChatScreen(
-    chatManager: BluetoothChatManager?,
+    chatManagers: List<BluetoothChatManager>,
     viewModel: ChatViewModel,
     modifier: Modifier = Modifier,
     onLocationClick: (Double, Double) -> Unit = { _, _ -> }
@@ -47,8 +47,23 @@ fun ChatScreen(
     val context = LocalContext.current
     var messageText by remember { mutableStateOf("") }
     val allMessages by viewModel.allMessages.collectAsState()
-    val messages = remember(allMessages) {
-        allMessages.filter { it.status == "ACTIVE" }
+    val activeSosId = viewModel.activeUserSosId
+
+    val messages = remember(allMessages, activeSosId) {
+        // ALWAYS filter by ACTIVE status unless it's a critical alert
+        val activeOnly = allMessages.filter { it.status == "ACTIVE" || it.type == "ALERT" }
+        
+        if (activeSosId != null) {
+            // Priority Mode: Show my SOS and all other SOS/ALERTS from others
+            activeOnly.filter { 
+                it.messageId == activeSosId || 
+                it.messageId == "BEACON-${Math.abs(activeSosId.hashCode() % 100000)}" ||
+                it.type == "SOS" || 
+                it.type == "ALERT"
+            }
+        } else {
+            activeOnly
+        }
     }
     val listState = rememberLazyListState()
     val scope = rememberCoroutineScope()
@@ -84,46 +99,48 @@ fun ChatScreen(
 
     val haptic = LocalHapticFeedback.current
 
-    LaunchedEffect(chatManager) {
-        chatManager?.startListening(
-            onMessageReceived = { receivedContent ->
-                haptic.performHapticFeedback(HapticFeedbackType.LongPress)
-                viewModel.receiveAndForwardMessage(context, receivedContent, chatManager)
-            },
-            onAudioStart = { metadata ->
-                receivingMetadata = metadata
-                val audioDir = File(context.filesDir, "audio_messages")
-                audioDir.mkdirs()
-                receivingFile = File(audioDir, "rx_${System.currentTimeMillis()}.pcm")
-                receivingStream = FileOutputStream(receivingFile)
-            },
-            onAudioChunk = { audioData ->
-                try {
-                    receivingStream?.write(audioData)
-                    voiceManager.playChunk(audioData)
-                } catch (e: Exception) { e.printStackTrace() }
-            },
-            onAudioEnd = {
-                receivingStream?.close()
-                receivingFile?.let { file ->
-                    val meta = receivingMetadata?.split("|")
-                    val name = meta?.getOrNull(0) ?: "Survivor"
-                    val lat = meta?.getOrNull(1)?.toDoubleOrNull()
-                    val lon = meta?.getOrNull(2)?.toDoubleOrNull()
-                    viewModel.saveVoiceMessage(
-                        path = file.absolutePath,
-                        isMe = false,
-                        chatManager = chatManager,
-                        senderName = name,
-                        lat = lat,
-                        lon = lon
-                    )
+    chatManagers.forEach { manager ->
+        LaunchedEffect(manager) {
+            manager.startListening(
+                onMessageReceived = { receivedContent ->
+                    haptic.performHapticFeedback(HapticFeedbackType.LongPress)
+                    viewModel.receiveAndForwardMessage(context, receivedContent, manager, chatManagers)
+                },
+                onAudioStart = { metadata ->
+                    receivingMetadata = metadata
+                    val audioDir = File(context.filesDir, "audio_messages")
+                    audioDir.mkdirs()
+                    receivingFile = File(audioDir, "rx_${System.currentTimeMillis()}.pcm")
+                    receivingStream = FileOutputStream(receivingFile)
+                },
+                onAudioChunk = { audioData ->
+                    try {
+                        receivingStream?.write(audioData)
+                        voiceManager.playChunk(audioData)
+                    } catch (e: Exception) { e.printStackTrace() }
+                },
+                onAudioEnd = {
+                    receivingStream?.close()
+                    receivingFile?.let { file ->
+                        val meta = receivingMetadata?.split("|")
+                        val name = meta?.getOrNull(0) ?: "Survivor"
+                        val lat = meta?.getOrNull(1)?.toDoubleOrNull()
+                        val lon = meta?.getOrNull(2)?.toDoubleOrNull()
+                        viewModel.saveVoiceMessage(
+                            path = file.absolutePath,
+                            isMe = false,
+                            chatManagers = chatManagers,
+                            senderName = name,
+                            lat = lat,
+                            lon = lon
+                        )
+                    }
+                    receivingFile = null
+                    receivingStream = null
+                    receivingMetadata = null
                 }
-                receivingFile = null
-                receivingStream = null
-                receivingMetadata = null
-            }
-        )
+            )
+        }
     }
 
     DisposableEffect(Unit) {
@@ -161,7 +178,7 @@ fun ChatScreen(
                             }
                         }
                     },
-                    onDelete = { viewModel.deleteMessage(msg.messageId) }
+                    onDelete = { viewModel.deleteMessage(msg.messageId, chatManagers) }
                 )
             }
         }
@@ -205,7 +222,8 @@ fun ChatScreen(
                                     if (isRecording) {
                                         isRecording = false
                                         voiceManager.stopRecording()
-                                        chatManager?.stopAudioStream()
+                                        // Current multi-audio stream logic (simplified for now)
+                                        chatManagers.forEach { it.stopAudioStream() }
                                         currentRecordingPath?.let { path ->
                                             val file = File(path)
                                             if (file.exists() && file.length() > 0) {
@@ -213,7 +231,7 @@ fun ChatScreen(
                                                 viewModel.saveVoiceMessage(
                                                     path = path,
                                                     isMe = true,
-                                                    chatManager = chatManager,
+                                                    chatManagers = chatManagers,
                                                     lat = lastRecordingLocation?.first,
                                                     lon = lastRecordingLocation?.second
                                                 )
@@ -240,10 +258,10 @@ fun ChatScreen(
                                         
                                         isRecording = true
                                         val metadata = "${viewModel.userName}|${location?.latitude}|${location?.longitude}"
-                                        chatManager?.startAudioStream(metadata)
+                                        chatManagers.forEach { it.startAudioStream(metadata) }
                                         
                                         voiceManager.startRecording(context, file) { data, size ->
-                                            chatManager?.sendAudioChunk(data, size)
+                                            chatManagers.forEach { it.sendAudioChunk(data, size) }
                                         }
                                     }
                                 } catch (e: Exception) {
@@ -290,10 +308,15 @@ fun ChatScreen(
                                     try {
                                         val fusedLocationClient = LocationServices.getFusedLocationProviderClient(context)
                                         @SuppressLint("MissingPermission")
-                                        val location = fusedLocationClient.getCurrentLocation(Priority.PRIORITY_BALANCED_POWER_ACCURACY, null).await()
-                                        viewModel.sendMessage(chatManager, textToSend, lat = location?.latitude, lon = location?.longitude)
+                                        val location = try {
+                                            // Try last location first for speed, then current location
+                                            fusedLocationClient.lastLocation.await() ?: 
+                                            fusedLocationClient.getCurrentLocation(Priority.PRIORITY_BALANCED_POWER_ACCURACY, null).await()
+                                        } catch (e: Exception) { null }
+                                        
+                                        viewModel.sendMessage(chatManagers, textToSend, lat = location?.latitude, lon = location?.longitude)
                                     } catch (e: Exception) {
-                                        viewModel.sendMessage(chatManager, textToSend)
+                                        viewModel.sendMessage(chatManagers, textToSend)
                                     }
                                 }
                             }
@@ -406,22 +429,30 @@ fun ChatBubble(
             tonalElevation = if (msg.type == "SOS") 8.dp else 2.dp
         ) {
             Column(modifier = Modifier.padding(12.dp)) {
-                if (msg.type == "SOS" || msg.type == "VOICE") {
+                if (msg.type == "SOS" || msg.type == "VOICE" || (msg.type == "CHAT" && msg.latitude != null)) {
                     Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.padding(bottom = 4.dp)) {
-                        val icon = if (msg.type == "SOS") Icons.Default.Warning else Icons.Default.Mic
-                        Icon(icon, null, tint = Color.White, modifier = Modifier.size(16.dp))
+                        val icon = when(msg.type) {
+                            "SOS" -> Icons.Default.Warning
+                            "VOICE" -> Icons.Default.Mic
+                            else -> Icons.Default.LocationOn
+                        }
+                        Icon(icon, null, tint = contentColor.copy(alpha = 0.9f), modifier = Modifier.size(12.dp))
                         
-                        // Preserve the identical numeric ID from the mesh
                         val numericId = if (msg.messageId.startsWith("BEACON-")) {
                             msg.messageId.removePrefix("BEACON-")
                         } else {
                             Math.abs(msg.messageId.hashCode() % 100000).toString().padStart(5, '0')
                         }
 
-                        val label = if (msg.type == "SOS") "SOS" else "VOICE"
+                        val label = when(msg.type) {
+                            "SOS" -> "SOS"
+                            "VOICE" -> "VOICE"
+                            else -> "LOCATION ATTACHED"
+                        }
                         val triage = if (msg.type == "SOS") " | LEVEL: ${msg.triageLevel}" else ""
+                        val idText = if (msg.type != "CHAT") " ID: #$numericId" else ""
                         
-                        Text(" $label ID: #$numericId$triage", fontWeight = FontWeight.Black, fontSize = 9.sp, color = Color.White)
+                        Text(" $label$idText$triage", fontWeight = FontWeight.Black, fontSize = 9.sp, color = contentColor.copy(alpha = 0.9f))
                     }
                 }
                 

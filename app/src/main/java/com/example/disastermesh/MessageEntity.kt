@@ -6,10 +6,8 @@ import androidx.room.PrimaryKey
 @Entity(tableName = "messages")
 data class MessageEntity(
 
-    @PrimaryKey(autoGenerate = true)
-    val id: Int = 0,
-
-    val messageId: String = java.util.UUID.randomUUID().toString(),
+    @PrimaryKey
+    val messageId: String,
 
     val sender: String,
 
@@ -17,7 +15,7 @@ data class MessageEntity(
 
     val message: String,
 
-    val type: String = "CHAT", // CHAT, SOS, RESOURCE, ALERT
+    val type: String = "CHAT", // CHAT, SOS, RESOURCE, ALERT, VOICE
 
     val timestamp: Long = System.currentTimeMillis(),
 

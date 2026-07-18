@@ -17,7 +17,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 
 @Composable
-fun ResourceScreen(viewModel: ChatViewModel, chatManager: BluetoothChatManager?) {
+fun ResourceScreen(viewModel: ChatViewModel, chatManagers: List<BluetoothChatManager>) {
     val context = LocalContext.current
     val resources = listOf(
         "Clean Water" to "water_drop",
@@ -64,7 +64,7 @@ fun ResourceScreen(viewModel: ChatViewModel, chatManager: BluetoothChatManager?)
             items(resources) { (name, icon) ->
                 Surface(
                     onClick = {
-                        viewModel.markResource(context, chatManager, name)
+                        viewModel.markResource(context, chatManagers, name)
                         status = "Pinned $name on the mesh map!"
                     },
                     modifier = Modifier.fillMaxWidth(),

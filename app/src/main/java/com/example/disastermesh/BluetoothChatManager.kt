@@ -7,11 +7,14 @@ import java.io.InputStream
 import java.io.OutputStream
 
 class BluetoothChatManager(
-    private val socket: BluetoothSocket
+    private val socket: BluetoothSocket,
+    private val onDisconnected: (BluetoothChatManager) -> Unit = {}
 ) {
     private val inputStream: InputStream = socket.inputStream
     private val outputStream: OutputStream = socket.outputStream
     private var listeningJob: Job? = null
+    
+    val remoteAddress: String = socket.remoteDevice.address
 
     // Protocol Constants
     private val TYPE_TEXT = 0x01.toByte()
@@ -36,22 +39,20 @@ class BluetoothChatManager(
     }
 
     private fun sendPacket(type: Byte, data: ByteArray) {
-        CoroutineScope(Dispatchers.IO).launch {
-            try {
-                val packet = ByteArray(data.size + 5)
-                packet[0] = type
-                val len = data.size
-                packet[1] = (len shr 24).toByte()
-                packet[2] = (len shr 16).toByte()
-                packet[3] = (len shr 8).toByte()
-                packet[4] = len.toByte()
-                System.arraycopy(data, 0, packet, 5, data.size)
-                
-                outputStream.write(packet)
-                outputStream.flush()
-            } catch (e: Exception) {
-                Log.e("MeshChat", "Packet send error: ${e.message}")
-            }
+        try {
+            val packet = ByteArray(data.size + 5)
+            packet[0] = type
+            val len = data.size
+            packet[1] = (len shr 24).toByte()
+            packet[2] = (len shr 16).toByte()
+            packet[3] = (len shr 8).toByte()
+            packet[4] = len.toByte()
+            System.arraycopy(data, 0, packet, 5, data.size)
+            
+            outputStream.write(packet)
+            // No flush needed for standard BT sockets, prevents blocking delay
+        } catch (e: Exception) {
+            Log.e("MeshChat", "Packet send error: ${e.message}")
         }
     }
 
@@ -98,6 +99,9 @@ class BluetoothChatManager(
                 }
             } catch (e: Exception) {
                 Log.e("MeshChat", "Listen error: ${e.message}")
+                withContext(Dispatchers.Main) {
+                    onDisconnected(this@BluetoothChatManager)
+                }
             }
         }
     }

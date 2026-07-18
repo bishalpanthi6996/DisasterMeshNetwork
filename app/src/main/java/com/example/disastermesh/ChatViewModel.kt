@@ -10,6 +10,7 @@ import android.util.Base64
 import android.widget.Toast
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.setValue
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
@@ -23,6 +24,8 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.tasks.await
+import retrofit2.Retrofit
+import retrofit2.converter.gson.GsonConverterFactory
 import java.io.File
 
 class ChatViewModel(private val repository: MessageRepository) : ViewModel() {
@@ -42,14 +45,36 @@ class ChatViewModel(private val repository: MessageRepository) : ViewModel() {
     var currentEmergencyMode by mutableStateOf("EARTHQUAKE") // Locked to Earthquake for pitch
     
     var activeUserSosId by mutableStateOf<String?>(null)
-    private val processedBleIds = mutableSetOf<String>()
+    private val processingIds = mutableSetOf<String>()
+    private val relayCooldowns = mutableMapOf<String, Long>()
+    
+    // Feature: Global Anti-Duplication Memory
+    private val processedMessageIds = mutableSetOf<String>()
+    
+    // Feature: Persistent Anti-Spam Memory (Does not clear on wipe)
+    private val permanentSpamFilter = mutableSetOf<String>()
+    
+    var nearbyNodeCount by mutableIntStateOf(0)
     
     // Live Tracking States
     private var locationBroadcasterJob: Job? = null
+    private var lastBroadcastLat: Double? = null
+    private var lastBroadcastLon: Double? = null
     
     // Hybrid Network States
     var isGatewayActive by mutableStateOf(false)
     var cloudSyncStatus by mutableStateOf("Standby") // Standby, Syncing, Online
+    
+    // Feature: Disaster Feed Tracking
+    var activeDisasterAlert by mutableStateOf<DisasterFeed?>(null)
+    private var disasterMonitorJob: Job? = null
+
+    private val retrofit = Retrofit.Builder()
+        .baseUrl("http://10.0.2.2:8080/api/v1/") // Localhost for Android Emulator
+        .addConverterFactory(GsonConverterFactory.create())
+        .build()
+    
+    private val apiService = retrofit.create(ApiService::class.java)
 
     val allMessages: StateFlow<List<MessageEntity>> = repository.allMessages
         .stateIn(
@@ -57,6 +82,10 @@ class ChatViewModel(private val repository: MessageRepository) : ViewModel() {
             started = SharingStarted.WhileSubscribed(5000),
             initialValue = emptyList()
         )
+    
+    // Feature: Isolation Filter for UI
+    val filteredMessages: StateFlow<List<MessageEntity>> = repository.allMessages
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
     
     fun checkActiveSos() {
         viewModelScope.launch {
@@ -73,10 +102,85 @@ class ChatViewModel(private val repository: MessageRepository) : ViewModel() {
                 
                 if (isConnected) {
                     performCloudSync()
+                    checkForDisasterFeeds(context)
+                    checkForNearbyCloudSos(context)
                 }
                 delay(10000) // Check every 10 seconds
             }
         }
+    }
+
+    private suspend fun checkForNearbyCloudSos(context: Context) {
+        if (!isGatewayActive) return
+        try {
+            val fusedLocationClient = LocationServices.getFusedLocationProviderClient(context)
+            @SuppressLint("MissingPermission")
+            val myLoc = fusedLocationClient.lastLocation.await() ?: return
+            
+            val response = apiService.getNearbySos(myLoc.latitude, myLoc.longitude, 5.0) // 5km radius
+            if (response.isSuccessful) {
+                val nearbySosList = response.body() ?: return
+                nearbySosList.forEach { sos ->
+                    // Standardize SOS ID
+                    val msgId = if (sos.messageId.startsWith("BEACON-")) sos.messageId 
+                                else "BEACON-${Math.abs(sos.messageId.hashCode() % 100000)}"
+                    
+                    // Don't add if it's our own
+                    if (msgId == activeUserSosId) return@forEach
+                    
+                    if (!repository.exists(msgId)) {
+                        val entity = sos.copy(
+                            messageId = msgId,
+                            sender = "Nearby Survivor (Cloud)",
+                            isCloudSynced = true
+                        )
+                        repository.insertMessage(entity)
+                        processedMessageIds.add(msgId)
+                        
+                        // If it's a new critical SOS from cloud, notify the user
+                        if (entity.triageLevel == "CRITICAL") {
+                            Toast.makeText(context, "📡 CLOUD RESCUE ALERT: Nearby SOS Detected!", Toast.LENGTH_LONG).show()
+                            activeHazardZone = Pair(entity.latitude ?: 0.0, entity.longitude ?: 0.0)
+                        }
+                    }
+                }
+            }
+        } catch (e: Exception) { e.printStackTrace() }
+    }
+
+    private suspend fun checkForDisasterFeeds(context: Context) {
+        try {
+            val response = apiService.getActiveDisasters()
+            if (response.isSuccessful) {
+                val disasters = response.body() ?: return
+                val fusedLocationClient = LocationServices.getFusedLocationProviderClient(context)
+                @SuppressLint("MissingPermission")
+                val myLoc = fusedLocationClient.lastLocation.await() ?: return
+                
+                for (disaster in disasters) {
+                    val distance = calculateDistance(myLoc.latitude, myLoc.longitude, disaster.latitude, disaster.longitude)
+                    if (distance <= disaster.radiusKm * 1000) {
+                        // User is in impact area!
+                        activeDisasterAlert = disaster
+                        isSafetyCheckActive = true
+                        break
+                    }
+                }
+            }
+        } catch (e: Exception) { e.printStackTrace() }
+    }
+
+    private fun calculateDistance(lat1: Double, lon1: Double, lat2: Double, lon2: Double): Double {
+        val r = 6371e3 // Earth radius in meters
+        val phi1 = Math.toRadians(lat1)
+        val phi2 = Math.toRadians(lat2)
+        val dPhi = Math.toRadians(lat2 - lat1)
+        val dLambda = Math.toRadians(lon2 - lon1)
+        val a = Math.sin(dPhi / 2) * Math.sin(dPhi / 2) +
+                Math.cos(phi1) * Math.cos(phi2) *
+                Math.sin(dLambda / 2) * Math.sin(dLambda / 2)
+        val c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a))
+        return r * c
     }
 
     private suspend fun performCloudSync() {
@@ -88,11 +192,14 @@ class ChatViewModel(private val repository: MessageRepository) : ViewModel() {
         cloudSyncStatus = "Syncing ${unsynced.size} nodes..."
         
         unsynced.forEach { msg ->
-            // Simulating API Call to a central dashboard
-            // In a real app: Ktor or Retrofit call here
-            // httpClient.post("https://emergency-api.gov/sync", msg)
-            delay(500) // Simulating network latency
-            repository.updateSyncStatus(msg.messageId, true)
+            try {
+                val response = apiService.syncMessage(msg)
+                if (response.isSuccessful) {
+                    repository.updateSyncStatus(msg.messageId, true)
+                }
+            } catch (e: Exception) {
+                e.printStackTrace()
+            }
         }
         
         cloudSyncStatus = "Cloud Synchronized"
@@ -105,10 +212,9 @@ class ChatViewModel(private val repository: MessageRepository) : ViewModel() {
         return batteryStatus?.getIntExtra(BatteryManager.EXTRA_LEVEL, -1) ?: -1
     }
 
-    @SuppressLint("MissingPermission")
     fun sendSos(
         context: Context,
-        chatManager: BluetoothChatManager?,
+        chatManagers: List<BluetoothChatManager>,
         content: String,
         triage: String = "STABLE",
         victimCount: Int = 1,
@@ -124,6 +230,7 @@ class ChatViewModel(private val repository: MessageRepository) : ViewModel() {
             }
 
             val fusedLocationClient = LocationServices.getFusedLocationProviderClient(context)
+            @SuppressLint("MissingPermission")
             val location = try {
                 fusedLocationClient.getCurrentLocation(Priority.PRIORITY_HIGH_ACCURACY, null).await()
             } catch (e: Exception) {
@@ -131,7 +238,7 @@ class ChatViewModel(private val repository: MessageRepository) : ViewModel() {
             }
             
             sendMessage(
-                chatManager = chatManager,
+                chatManagers = chatManagers,
                 content = content,
                 type = "SOS",
                 lat = location?.latitude,
@@ -142,22 +249,11 @@ class ChatViewModel(private val repository: MessageRepository) : ViewModel() {
             )
 
             // Feature 12: Start Live Location Broadcaster
-            startLiveLocationBroadcast(context, chatManager)
-            
-            // Government API Bridge: SMS Fallback
-            if (triage == "CRITICAL") {
-                try {
-                    val smsManager = context.getSystemService(SmsManager::class.java)
-                    val smsText = "CRITICAL SOS: $userName at ${location?.latitude},${location?.longitude}. Msg: $content"
-                    // In real life, this would be a government emergency number
-                    // smsManager.sendTextMessage("911", null, smsText, null, null)
-                    Toast.makeText(context, "Critical SMS Sent to Authorities", Toast.LENGTH_SHORT).show()
-                } catch (e: Exception) { e.printStackTrace() }
-            }
+            startLiveLocationBroadcast(context, chatManagers)
         }
     }
 
-    fun markResource(context: Context, chatManager: BluetoothChatManager?, resourceName: String) {
+    fun markResource(context: Context, chatManagers: List<BluetoothChatManager>, resourceName: String) {
         viewModelScope.launch {
             val fusedLocationClient = LocationServices.getFusedLocationProviderClient(context)
             val location = try {
@@ -167,7 +263,7 @@ class ChatViewModel(private val repository: MessageRepository) : ViewModel() {
                 null
             }
             sendMessage(
-                chatManager = chatManager,
+                chatManagers = chatManagers,
                 content = resourceName,
                 type = "RESOURCE",
                 lat = location?.latitude,
@@ -177,14 +273,15 @@ class ChatViewModel(private val repository: MessageRepository) : ViewModel() {
     }
 
     fun sendMessage(
-        chatManager: BluetoothChatManager?,
+        chatManagers: List<BluetoothChatManager>,
         content: String,
         type: String = "CHAT",
         lat: Double? = null,
         lon: Double? = null,
         triage: String = "STABLE",
         victimCount: Int = 1,
-        hazardType: String = "GENERAL"
+        hazardType: String = "GENERAL",
+        messageId: String? = null
     ) {
         if (content.isBlank()) return
 
@@ -194,7 +291,15 @@ class ChatViewModel(private val repository: MessageRepository) : ViewModel() {
             val battery = 85 // Mock battery for now
             val calculatedRank = NLPAnalyzer.calculateEmergencyRank(analyzedTriage, victimCount, battery, System.currentTimeMillis())
             
-            val msgId = java.util.UUID.randomUUID().toString()
+            // Standardize SOS ID to the Beacon format (Hashed numeric)
+            // This ensures Classic BT and BLE signals use the EXACT SAME ID for deduplication
+            val rawId = messageId ?: java.util.UUID.randomUUID().toString()
+            val msgId = if (type == "SOS") {
+                val numericHash = if (rawId.startsWith("BEACON-")) rawId.removePrefix("BEACON-").toIntOrNull()
+                                 else Math.abs(rawId.hashCode() % 100000)
+                "BEACON-${numericHash}"
+            } else rawId
+            
             if (type == "SOS") activeUserSosId = msgId
 
             val messageEntity = MessageEntity(
@@ -220,12 +325,12 @@ class ChatViewModel(private val repository: MessageRepository) : ViewModel() {
             val verified = if (isGovernmentUser) "1" else "0"
             val rawPayload = "$msgId|$userName|$type|$lat|$lon|$verified|$analyzedTriage|$victimCount|$battery|$hazardType|5|$content"
             val encryptedPayload = EncryptionUtils.encrypt(rawPayload)
-            chatManager?.sendMessage(encryptedPayload)
+            chatManagers.forEach { it.sendMessage(encryptedPayload) }
         }
     }
 
     @SuppressLint("MissingPermission")
-    private fun startLiveLocationBroadcast(context: Context, chatManager: BluetoothChatManager?) {
+    private fun startLiveLocationBroadcast(context: Context, chatManagers: List<BluetoothChatManager>) {
         locationBroadcasterJob?.cancel()
         locationBroadcasterJob = viewModelScope.launch {
             val fusedLocationClient = LocationServices.getFusedLocationProviderClient(context)
@@ -236,32 +341,53 @@ class ChatViewModel(private val repository: MessageRepository) : ViewModel() {
                 } catch (e: Exception) { null }
 
                 location?.let {
-                    // Broadcast a 'LOC_UPDATE' packet
-                    // Protocol: "ID|NAME|TYPE|LAT|LON|VERIFIED|TRIAGE|COUNT|BATTERY|HAZARD|TTL|MESSAGE"
-                    val sosId = activeUserSosId ?: return@let
-                    val rawPayload = "$sosId|$userName|LOC_UPDATE|${it.latitude}|${it.longitude}|0|STABLE|0|100|EARTHQUAKE|3|UPDATE"
-                    val encryptedPayload = EncryptionUtils.encrypt(rawPayload)
-                    chatManager?.sendMessage(encryptedPayload)
+                    // Feature: Significant Movement Filter (Prevents battery drain and network spam)
+                    val dist = if (lastBroadcastLat != null && lastBroadcastLon != null) {
+                        calculateDistance(it.latitude, it.longitude, lastBroadcastLat!!, lastBroadcastLon!!)
+                    } else 100.0
                     
-                    // Update local DB for self-view
-                    repository.updateMessageLocation(sosId, it.latitude, it.longitude)
+                    if (dist > 5.0) { // Only broadcast if moved more than 5 meters
+                        val sosId = activeUserSosId ?: return@let
+                        val rawPayload = "$sosId|$userName|LOC_UPDATE|${it.latitude}|${it.longitude}|0|STABLE|0|100|EARTHQUAKE|3|UPDATE"
+                        val encryptedPayload = EncryptionUtils.encrypt(rawPayload)
+                        chatManagers.forEach { it.sendMessage(encryptedPayload) }
+                        
+                        lastBroadcastLat = it.latitude
+                        lastBroadcastLon = it.longitude
+                        
+                        // Update local DB for self-view
+                        repository.updateMessageLocation(sosId, it.latitude, it.longitude)
+                    }
                 }
             }
         }
     }
 
-    fun receiveAndForwardMessage(context: Context, encryptedPayload: String, chatManager: BluetoothChatManager?) {
+    fun receiveAndForwardMessage(context: Context, encryptedPayload: String, currentManager: BluetoothChatManager?, allManagers: List<BluetoothChatManager>) {
         viewModelScope.launch {
             try {
                 val payload = EncryptionUtils.decrypt(encryptedPayload) ?: return@launch
                 val parts = payload.split("|", limit = 12)
                 if (parts.size < 12) return@launch
 
-                val msgId = parts[0]
-                if (repository.exists(msgId)) return@launch
+                val rawMsgId = parts[0]
+                val type = parts[2]
+                
+                // SOS ID Standardization
+                val msgId = if (type == "SOS" || type == "LOC_UPDATE") {
+                    val numericHash = if (rawMsgId.startsWith("BEACON-")) rawMsgId.removePrefix("BEACON-").toIntOrNull()
+                                     else Math.abs(rawMsgId.hashCode() % 100000)
+                    "BEACON-${numericHash}"
+                } else rawMsgId
+
+                // GLOBAL DEDUPLICATION: If we've already processed this exact message, stop immediately.
+                if (processedMessageIds.contains(msgId) && type != "LOC_UPDATE" && type != "UPDATE") return@launch
+                if (repository.exists(msgId) && type != "LOC_UPDATE" && type != "UPDATE") {
+                    processedMessageIds.add(msgId)
+                    return@launch
+                }
 
                 val sName = parts[1]
-                val type = parts[2]
                 val lat = parts[3].toDoubleOrNull()
                 val lon = parts[4].toDoubleOrNull()
                 val verified = parts[5] == "1"
@@ -281,7 +407,12 @@ class ChatViewModel(private val repository: MessageRepository) : ViewModel() {
                         // Forward the update
                         if (ttl > 1) {
                             val newPayload = "$msgId|$sName|LOC_UPDATE|$lat|$lon|0|STABLE|0|100|EARTHQUAKE|${ttl-1}|UPDATE"
-                            chatManager?.sendMessage(EncryptionUtils.encrypt(newPayload))
+                            val enc = EncryptionUtils.encrypt(newPayload)
+                            allManagers.forEach { manager ->
+                                if (manager != currentManager) {
+                                    manager.sendMessage(enc)
+                                }
+                            }
                         }
                     }
                     return@launch
@@ -289,7 +420,29 @@ class ChatViewModel(private val repository: MessageRepository) : ViewModel() {
 
                 // Handle SOS Resolution/Update (Feature: Duplicate Prevention)
                 if (type == "UPDATE") {
-                    repository.updateMessageStatus(msgId, content.replace("SOS_", ""))
+                    val statusStr = content.replace("SOS_", "")
+                    if (statusStr == "SOLVED" || statusStr == "CANCELLED" || statusStr == "RESOLVED") {
+                        repository.deleteMessage(msgId)
+                        processedMessageIds.remove(msgId)
+                        // Also clear from permanent filter to allow future SOS from same node
+                        val filterPrefix = "${msgId}_${lat}_${lon}"
+                        permanentSpamFilter.remove("${filterPrefix}_STABLE")
+                        permanentSpamFilter.remove("${filterPrefix}_SERIOUS")
+                        permanentSpamFilter.remove("${filterPrefix}_CRITICAL")
+                    } else {
+                        repository.updateMessageStatus(msgId, statusStr)
+                    }
+
+                    // Forward the update to the rest of the mesh
+                    if (ttl > 1) {
+                        val newPayload = "$msgId|$sName|UPDATE|$lat|$lon|${parts[5]}|$triage|$vCount|$battery|$hazard|${ttl-1}|$content"
+                        val enc = EncryptionUtils.encrypt(newPayload)
+                        allManagers.forEach { manager ->
+                            if (manager != currentManager) {
+                                manager.sendMessage(enc)
+                            }
+                        }
+                    }
                     return@launch
                 }
 
@@ -309,9 +462,12 @@ class ChatViewModel(private val repository: MessageRepository) : ViewModel() {
                 }
 
                 // Automatic Disaster Detection
-                if (type == "ALERT") {
-                    isSafetyCheckActive = true
-                    activeHazardZone = if (lat != null && lon != null) Pair(lat, lon) else null
+                if (type == "ALERT" || type == "SOS") {
+                    if (type == "ALERT") {
+                        isSafetyCheckActive = true
+                        activeHazardZone = if (lat != null && lon != null) Pair(lat, lon) else null
+                    }
+                    // For SOS, ensure we notify the user even if they are in Comms
                 }
 
                 val messageEntity = MessageEntity(
@@ -333,6 +489,7 @@ class ChatViewModel(private val repository: MessageRepository) : ViewModel() {
                     audioDuration = duration
                 )
                 repository.insertMessage(messageEntity)
+                processedMessageIds.add(msgId)
 
                 // Feature 6: Battery Optimization & Forwarding
                 val batteryLevel = getBatteryLevel(context)
@@ -345,14 +502,17 @@ class ChatViewModel(private val repository: MessageRepository) : ViewModel() {
                 if (shouldForward && ttl > 1) {
                     val newPayload = "$msgId|$sName|$type|$lat|$lon|${parts[5]}|$triage|$vCount|$battery|$hazard|${ttl-1}|$content"
                     val newEncrypted = EncryptionUtils.encrypt(newPayload)
-                    chatManager?.sendMessage(newEncrypted)
+                    allManagers.forEach { manager ->
+                        if (manager != currentManager) {
+                            manager.sendMessage(newEncrypted)
+                        }
+                    }
                 }
             } catch (e: Exception) { e.printStackTrace() }
         }
     }
 
-    fun syncHistory(chatManager: BluetoothChatManager?) {
-        if (chatManager == null) return
+    fun syncHistory(chatManager: BluetoothChatManager) {
         viewModelScope.launch {
             val messages = repository.allMessages.stateIn(this).value
             messages.forEach { msg ->
@@ -365,80 +525,276 @@ class ChatViewModel(private val repository: MessageRepository) : ViewModel() {
         }
     }
 
-    fun clearAllData() {
+    fun clearAllData(context: Context, chatManagers: List<BluetoothChatManager> = emptyList()) {
         viewModelScope.launch {
+            if (activeUserSosId != null) {
+                val sosId = activeUserSosId!!
+                // 1. Broadcast "CANCELLED" status to the mesh (Classic Bluetooth)
+                val rawPayload = "$sosId|$userName|UPDATE|0.0|0.0|0|STABLE|0|0|GENERAL|5|SOS_CANCELLED"
+                val encryptedPayload = EncryptionUtils.encrypt(rawPayload)
+                chatManagers.forEach { it.sendMessage(encryptedPayload) }
+                
+                // 2. Update status to trigger BLE RESOLVED broadcast in MainActivity
+                repository.updateMessageStatus(sosId, "CANCELLED")
+                
+                // 3. WAIT: Give MainActivity's loop (which runs every 5s) time to see this
+                // We'll wait 6 seconds to be absolutely sure the broadcast starts.
+                delay(6000) 
+
+                activeUserSosId = null
+                locationBroadcasterJob?.cancel()
+                locationBroadcasterJob = null
+            }
             repository.deleteAllMessages()
+            processingIds.clear()
+            relayCooldowns.clear()
+            activeUserSosId = null
         }
     }
 
-    fun confirmSafety() {
+    fun confirmSafety(context: Context, isSafe: Boolean, chatManagers: List<BluetoothChatManager> = emptyList()) {
         isSafetyCheckActive = false
-        // Optionally broadcast "I'm Safe" to the mesh
-        // sendMessage(null, "User confirmed safety", type = "INFO")
+        val disaster = activeDisasterAlert ?: return
+        
+        viewModelScope.launch {
+            val fusedLocationClient = LocationServices.getFusedLocationProviderClient(context)
+            @SuppressLint("MissingPermission")
+            val loc = fusedLocationClient.lastLocation.await()
+            
+            // SIMULATED BACKEND REPORT
+            if (isGatewayActive) {
+                Toast.makeText(context, "📡 REPORTING TO GOVT: User is ${if(isSafe) "SAFE" else "IN RISK"}", Toast.LENGTH_SHORT).show()
+                // apiService.reportUserStatus(userName, isSafe, loc?.latitude ?: 0.0, loc?.longitude ?: 0.0)
+            } else {
+                Toast.makeText(context, "📶 [EDGE/SMS] REPORTING SAFETY STATUS...", Toast.LENGTH_SHORT).show()
+            }
+            
+            if (!isSafe) {
+                triggerAutoSos(context, "USER_REPORTED_RISK: ${disaster.name}", chatManagers)
+            }
+            
+            activeDisasterAlert = null
+        }
     }
 
-    fun deleteMessage(msgId: String) {
+    private var isSmsFallbackTriggered = false
+
+    fun triggerAutoSos(context: Context, content: String, chatManagers: List<BluetoothChatManager> = emptyList()) {
+        viewModelScope.launch {
+            // Check if we already have an active SOS to prevent duplicates
+            val existingSos = repository.getActiveUserSos()
+            if (existingSos != null) {
+                activeUserSosId = existingSos.messageId
+                return@launch 
+            }
+
+            val fusedLocationClient = LocationServices.getFusedLocationProviderClient(context)
+            @SuppressLint("MissingPermission")
+            val location = fusedLocationClient.getCurrentLocation(Priority.PRIORITY_HIGH_ACCURACY, null).await()
+            
+            // Create a single unique ID for the entire SOS event (Victim, Mesh, and Cloud)
+            val uniqueSosId = "BEACON-${Math.abs(java.util.UUID.randomUUID().hashCode() % 100000)}"
+            activeUserSosId = uniqueSosId // Set immediately to prevent echo detection
+
+            // 1. Bluetooth Mesh Broadcast
+            sendMessage(
+                chatManagers = chatManagers,
+                content = content,
+                type = "SOS",
+                lat = location?.latitude,
+                lon = location?.longitude,
+                triage = "CRITICAL",
+                victimCount = 1,
+                hazardType = activeDisasterAlert?.name ?: "EARTHQUAKE",
+                messageId = uniqueSosId
+            )
+            
+            // Feature 12: Start Live Location Broadcaster
+            startLiveLocationBroadcast(context, chatManagers)
+
+            // 2. Cellular/Low-Speed Fallback (SERVER SIDE RESCUE)
+            delay(1500)
+            val mySos = repository.getMessageById(uniqueSosId)
+            if (mySos != null) {
+                try {
+                    val response = apiService.syncMessage(mySos)
+                    if (response.isSuccessful) {
+                        repository.updateSyncStatus(uniqueSosId, true)
+                        Toast.makeText(context, "✅ SERVER COORDINATION ACTIVE", Toast.LENGTH_SHORT).show()
+                    } else {
+                        // Server reachable but error -> Fallback to SMS Gateway
+                        sendSmsToGovernment(context, mySos)
+                    }
+                } catch (e: Exception) {
+                    // No Internet -> Fallback to SMS Gateway
+                    sendSmsToGovernment(context, mySos)
+                }
+            }
+        }
+    }
+
+    private fun sendSmsToGovernment(context: Context, sos: MessageEntity) {
+        if (isSmsFallbackTriggered) return // Prevent duplicate SMS costs
+        
+        try {
+            val smsManager = context.getSystemService(SmsManager::class.java)
+            // Protocol: SOS|ID|LAT|LON|TRIAGE|NAME
+            val smsText = "SOS|${sos.messageId.removePrefix("BEACON-")}|${sos.latitude}|${sos.longitude}|${sos.triageLevel}|$userName"
+            
+            // In a real scenario, "122" or "911" would be a specialized Server SMS Gateway number
+            // smsManager.sendTextMessage("122", null, smsText, null, null)
+            
+            Toast.makeText(context, "📶 CLOUD OFFLINE: Relaying SOS via SMS Gateway...", Toast.LENGTH_LONG).show()
+            isSmsFallbackTriggered = true
+        } catch (e: Exception) {
+            e.printStackTrace()
+            Toast.makeText(context, "❌ CRITICAL: No Cloud and No Cell Signal!", Toast.LENGTH_SHORT).show()
+        }
+    }
+
+    fun deleteMessage(msgId: String, chatManagers: List<BluetoothChatManager> = emptyList()) {
         viewModelScope.launch {
             val msg = repository.getMessageById(msgId)
+            
+            // If deleting our own active SOS, trigger a resolution broadcast first
+            if (msgId == activeUserSosId) {
+                // Broadcast "CANCELLED" status to the mesh before deleting locally
+                // This ensures other devices remove it too
+                val rawPayload = "$msgId|$userName|UPDATE|0.0|0.0|0|STABLE|0|0|GENERAL|5|SOS_CANCELLED"
+                val encryptedPayload = EncryptionUtils.encrypt(rawPayload)
+                chatManagers.forEach { it.sendMessage(encryptedPayload) }
+                
+                // Update status to trigger BLE RESOLVED broadcast in MainActivity
+                repository.updateMessageStatus(msgId, "CANCELLED")
+                
+                // 3. WAIT: Give MainActivity's loop (which runs every 5s) time to see this
+                // We'll wait 6 seconds to be absolutely sure the broadcast starts.
+                delay(6000)
+
+                activeUserSosId = null
+                locationBroadcasterJob?.cancel()
+                locationBroadcasterJob = null
+            }
+
             if (msg?.audioPath != null) {
                 try {
                     File(msg.audioPath).delete()
                 } catch (e: Exception) { e.printStackTrace() }
             }
             repository.deleteMessage(msgId)
+            processedMessageIds.remove(msgId)
         }
     }
 
-    fun resolveSos(context: Context, chatManager: BluetoothChatManager?, status: String) {
+    fun resolveSos(context: Context, chatManagers: List<BluetoothChatManager>, status: String) {
         viewModelScope.launch {
-            val sosId = activeUserSosId ?: repository.getActiveUserSos()?.messageId ?: return@launch
-            repository.updateMessageStatus(sosId, status)
+            val sosId = activeUserSosId ?: return@launch
             
-            // Stop Broadcaster
+            // Mark as solved/cancelled in DB. 
+            // MainActivity will detect this status change and broadcast the "RESOLVED" beacon.
+            repository.updateMessageStatus(sosId, status)
+
+            // Also broadcast via Classic Bluetooth if connected
+            // Protocol: "ID|NAME|TYPE|LAT|LON|VERIFIED|TRIAGE|COUNT|BATTERY|HAZARD|TTL|MESSAGE"
+            val rawPayload = "$sosId|$userName|UPDATE|0.0|0.0|0|STABLE|0|0|GENERAL|5|SOS_$status"
+            val encryptedPayload = EncryptionUtils.encrypt(rawPayload)
+            chatManagers.forEach { it.sendMessage(encryptedPayload) }
+            
+            Toast.makeText(context, "Broadcasting $status status to Mesh...", Toast.LENGTH_SHORT).show()
+        }
+    }
+
+    fun finalizeSosRemoval() {
+        viewModelScope.launch {
+            val sosId = activeUserSosId ?: return@launch
+            repository.deleteMessage(sosId)
+            activeUserSosId = null
             locationBroadcasterJob?.cancel()
             locationBroadcasterJob = null
-            
-            activeUserSosId = null
-            Toast.makeText(context, "SOS $status", Toast.LENGTH_SHORT).show()
         }
     }
 
     fun handleBleSosDetection(id: String, lat: Double, lon: Double, triage: String, vCount: Int, onForward: () -> Unit = {}) {
-        // Feature: Anti-Spam Gatekeeper
-        if (processedBleIds.contains(id)) return
-        if (id.contains(activeUserSosId ?: "NEVER_MATCH")) return // Don't relay our own SOS
+        // 1. Global Network Cleanup (MUST be first to bypass deduplication)
+        if (triage == "RESOLVED") {
+            viewModelScope.launch {
+                repository.deleteMessage(id)
+                // Remove from processed set so it can be re-added if a NEW SOS starts later
+                processedMessageIds.remove(id)
+                val spamKeyBase = "${id}_${lat}_${lon}"
+                permanentSpamFilter.remove("${spamKeyBase}_STABLE")
+                permanentSpamFilter.remove("${spamKeyBase}_SERIOUS")
+                permanentSpamFilter.remove("${spamKeyBase}_CRITICAL")
+                
+                // Forward the erasure to the rest of the mesh
+                onForward()
+            }
+            return
+        }
+
+        // 2. Identity Check: STOP ECHOES. If we are the one broadcasting this ID, IGNORE the detection.
+        if (id == activeUserSosId) return 
+        if (processedMessageIds.contains(id)) return
+        
+        // 3. Persistent Filter: If we've seen this exact ID + Coord today, don't re-add it
+        val spamKey = "${id}_${lat}_${lon}_$triage"
+        if (permanentSpamFilter.contains(spamKey)) return
+
+        // 4. Atomic Lock: Prevent simultaneous processing
+        if (processingIds.contains(id)) return
+        
+        if (lat == 0.0 || lon == 0.0) return 
+
+        processingIds.add(id)
+        permanentSpamFilter.add(spamKey) 
         
         viewModelScope.launch {
-            if (repository.exists(id)) {
-                processedBleIds.add(id)
-                return@launch
+            try {
+                // 5. Duplicate Check
+                val existing = repository.getMessageById(id)
+                if (existing != null) {
+                    processedMessageIds.add(id)
+                    if (existing.sender == "Me") return@launch
+                    if (existing.latitude == lat && existing.longitude == lon && existing.triageLevel == triage) {
+                        return@launch
+                    }
+                }
+                
+                processedMessageIds.add(id)
+                
+                val messageEntity = MessageEntity(
+                    messageId = id,
+                    sender = "Nearby Survivor",
+                    senderName = "Mesh Node",
+                    message = "CRITICAL SOS: EMERGENCY ASSISTANCE REQUIRED",
+                    type = "SOS",
+                    latitude = lat,
+                    longitude = lon,
+                    triageLevel = triage,
+                    victimCount = vCount,
+                    priority = NLPAnalyzer.calculateEmergencyRank(triage, vCount, -1, System.currentTimeMillis()),
+                    status = "ACTIVE"
+                )
+                repository.insertMessage(messageEntity)
+                
+                // 6. Intelligent Relay
+                val now = System.currentTimeMillis()
+                val lastRelay = relayCooldowns[id] ?: 0L
+                if (now - lastRelay > 15000) {
+                    relayCooldowns[id] = now
+                    onForward()
+                }
+            } finally {
+                delay(2000)
+                processingIds.remove(id)
             }
-            
-            processedBleIds.add(id)
-            val messageEntity = MessageEntity(
-                messageId = id,
-                sender = "Nearby Survivor",
-                senderName = "BLE Relay",
-                message = "CRITICAL SOS RELAYED VIA MESH NETWORK",
-                type = "SOS",
-                latitude = lat,
-                longitude = lon,
-                triageLevel = triage,
-                victimCount = vCount,
-                priority = NLPAnalyzer.calculateEmergencyRank(triage, vCount, -1, System.currentTimeMillis()),
-                status = "ACTIVE"
-            )
-            repository.insertMessage(messageEntity)
-            
-            // Trigger the automatic forwarding logic (Feature: Multi-hop)
-            onForward()
         }
     }
 
     fun saveVoiceMessage(
         path: String,
         isMe: Boolean,
-        chatManager: BluetoothChatManager? = null,
+        chatManagers: List<BluetoothChatManager> = emptyList(),
         senderName: String = "Survivor",
         lat: Double? = null,
         lon: Double? = null
@@ -462,7 +818,7 @@ class ChatViewModel(private val repository: MessageRepository) : ViewModel() {
             repository.insertMessage(messageEntity)
 
             // Broadcast Voice to Mesh if it's mine (Feature: Mesh-wide voice)
-            if (isMe && chatManager != null) {
+            if (isMe && chatManagers.isNotEmpty()) {
                 try {
                     val audioData = File(path).readBytes()
                     val base64Audio = Base64.encodeToString(audioData, Base64.NO_WRAP)
@@ -470,7 +826,7 @@ class ChatViewModel(private val repository: MessageRepository) : ViewModel() {
                     // Protocol: "ID|NAME|TYPE|LAT|LON|VERIFIED|TRIAGE|COUNT|BATTERY|HAZARD|TTL|MESSAGE"
                     val rawPayload = "$msgId|$userName|VOICE|$lat|$lon|0|STABLE|1|100|GENERAL|5|$base64Audio"
                     val encryptedPayload = EncryptionUtils.encrypt(rawPayload)
-                    chatManager.sendMessage(encryptedPayload)
+                    chatManagers.forEach { it.sendMessage(encryptedPayload) }
                 } catch (e: Exception) { e.printStackTrace() }
             }
         }

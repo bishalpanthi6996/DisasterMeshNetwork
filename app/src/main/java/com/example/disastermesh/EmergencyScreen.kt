@@ -20,7 +20,7 @@ import androidx.compose.ui.unit.sp
 import androidx.compose.ui.draw.alpha
 
 @Composable
-fun EmergencyScreen(viewModel: ChatViewModel, chatManager: BluetoothChatManager?) {
+fun EmergencyScreen(viewModel: ChatViewModel, chatManagers: List<BluetoothChatManager>) {
     val context = LocalContext.current
     var message by remember { mutableStateOf("") }
     var status by remember { mutableStateOf("") }
@@ -97,7 +97,7 @@ fun EmergencyScreen(viewModel: ChatViewModel, chatManager: BluetoothChatManager?
                     val finalMsg = if (message.isBlank()) "Emergency help needed: $selectedTriage" else message
                     viewModel.sendSos(
                         context = context,
-                        chatManager = chatManager,
+                        chatManagers = chatManagers,
                         content = finalMsg,
                         triage = selectedTriage,
                         victimCount = victimCount,
@@ -138,7 +138,7 @@ fun EmergencyScreen(viewModel: ChatViewModel, chatManager: BluetoothChatManager?
             Spacer(modifier = Modifier.height(32.dp))
 
             Button(
-                onClick = { viewModel.resolveSos(context, chatManager, "SOLVED") },
+                onClick = { viewModel.resolveSos(context, chatManagers, "SOLVED") },
                 modifier = Modifier.fillMaxWidth().height(56.dp),
                 colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF00C853))
             ) {
@@ -148,7 +148,7 @@ fun EmergencyScreen(viewModel: ChatViewModel, chatManager: BluetoothChatManager?
             Spacer(modifier = Modifier.height(16.dp))
 
             OutlinedButton(
-                onClick = { viewModel.resolveSos(context, chatManager, "CANCELLED") },
+                onClick = { viewModel.resolveSos(context, chatManagers, "CANCELLED") },
                 modifier = Modifier.fillMaxWidth().height(56.dp),
                 border = androidx.compose.foundation.BorderStroke(2.dp, Color.Red),
                 colors = ButtonDefaults.outlinedButtonColors(contentColor = Color.Red)

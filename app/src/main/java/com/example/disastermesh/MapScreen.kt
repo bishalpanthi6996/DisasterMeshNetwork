@@ -30,8 +30,14 @@ import java.util.Locale
 fun MapScreen(viewModel: ChatViewModel) {
     val context = LocalContext.current
     val allMessages by viewModel.allMessages.collectAsState()
-    val messages = remember(allMessages) {
-        allMessages.filter { it.status == "ACTIVE" }
+    val activeSosId = viewModel.activeUserSosId
+
+    val messages = remember(allMessages, activeSosId) {
+        if (activeSosId != null) {
+            allMessages.filter { it.messageId == activeSosId }
+        } else {
+            allMessages.filter { it.status == "ACTIVE" }
+        }
     }
     
     Configuration.getInstance().load(context, context.getSharedPreferences("osmdroid", 0))

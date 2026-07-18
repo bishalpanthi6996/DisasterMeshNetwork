@@ -15,7 +15,11 @@ class BLEManager(private val context: Context) {
     private val advertiser: BluetoothLeAdvertiser? get() = adapter?.bluetoothLeAdvertiser
     private val scanner: BluetoothLeScanner? get() = adapter?.bluetoothLeScanner
 
-    private val MESH_MANUFACTURER_ID = 0xFFFF 
+    private var currentAdvertiseCallback: AdvertiseCallback? = null
+    private var lastAdvertisedPayload: ByteArray? = null
+
+    // Feature: Hardened Proprietary Rescue Protocol
+    private val MESH_MANUFACTURER_ID = 0x5251 // 'RQ' Authenticated ID
     private val MESH_HEADER = "RESQ".toByteArray(Charsets.UTF_8)
 
     var onSosDetected: ((String, Double, Double, String, Int) -> Unit)? = null
@@ -23,63 +27,114 @@ class BLEManager(private val context: Context) {
     
     private val relayedIds = mutableSetOf<Int>()
     private var nearbyNodeCount = 0
+    private var isBurstMode = false
 
     @SuppressLint("MissingPermission")
     fun startSosBroadcast(sosId: String, lat: Double, lon: Double, triage: String, vCount: Int, isRelay: Boolean = false) {
         val adv = advertiser ?: return
         
-        val idHash = if (sosId.contains("-")) {
-            sosId.split("-").last().toIntOrNull() ?: sosId.hashCode()
-        } else {
-            sosId.hashCode()
-        }
+        val idHash = getBeaconId(sosId)
         
         if (isRelay && relayedIds.contains(idHash)) return
-        if (isRelay && nearbyNodeCount <= 1) return
-
         if (isRelay) relayedIds.add(idHash)
 
-        val settings = AdvertiseSettings.Builder()
-            .setAdvertiseMode(AdvertiseSettings.ADVERTISE_MODE_LOW_LATENCY)
-            .setConnectable(false)
-            .setTimeout(0)
-            .setTxPowerLevel(AdvertiseSettings.ADVERTISE_TX_POWER_HIGH)
-            .build()
+        // Enter Burst Mode for instant discovery if it's a new SOS
+        if (!isBurstMode) {
+            isBurstMode = true
+            restartScanningWithHighPriority()
+        }
 
-        // Format: HEADER(4) | ID_HASH(4) | LAT(8) | LON(8) | TRIAGE(1) | V_COUNT(1) = 26 bytes
-        val dataBuffer = ByteBuffer.allocate(26)
-        dataBuffer.put(MESH_HEADER)
-        dataBuffer.putInt(idHash)
-        dataBuffer.putDouble(lat)
-        dataBuffer.putDouble(lon)
+        // Triage: 1=STABLE, 2=SERIOUS, 3=CRITICAL, 4=RESOLVED/DELETE
         val triageByte = when(triage) {
+            "RESOLVED" -> 4
             "CRITICAL" -> 3
             "SERIOUS" -> 2
             else -> 1
         }.toByte()
+
+        val dataBuffer = ByteBuffer.allocate(27)
+        dataBuffer.put(MESH_HEADER)
+        dataBuffer.putInt(idHash)
+        dataBuffer.putDouble(lat)
+        dataBuffer.putDouble(lon)
         dataBuffer.put(triageByte)
         dataBuffer.put(vCount.toByte())
+        
+        val checksum = (idHash % 100 + lat.toInt() % 100 + lon.toInt() % 100 + triageByte + vCount).toByte()
+        dataBuffer.put(checksum)
+
+        val payload = dataBuffer.array()
+        
+        // Anti-Spam: Don't restart advertising if the payload is exactly the same
+        if (lastAdvertisedPayload?.contentEquals(payload) == true) {
+            return
+        }
+
+        // Stop existing advertisement before starting new one to prevent accumulation
+        currentAdvertiseCallback?.let {
+            adv.stopAdvertising(it)
+        }
+
+        val settings = AdvertiseSettings.Builder()
+            .setAdvertiseMode(AdvertiseSettings.ADVERTISE_MODE_LOW_LATENCY) // Fast advertising
+            .setConnectable(false)
+            .setTimeout(0)
+            .setTxPowerLevel(AdvertiseSettings.ADVERTISE_TX_POWER_HIGH) // High range
+            .build()
 
         val data = AdvertiseData.Builder()
-            .addManufacturerData(MESH_MANUFACTURER_ID, dataBuffer.array())
+            .addManufacturerData(MESH_MANUFACTURER_ID, payload)
             .setIncludeDeviceName(false)
             .build()
 
-        adv.startAdvertising(settings, data, object : AdvertiseCallback() {
+        val callback = object : AdvertiseCallback() {
             override fun onStartSuccess(settingsInEffect: AdvertiseSettings?) {
-                Log.d("BLEMesh", "Broadcast active for #$idHash with $vCount victims")
+                Log.d("BLEMesh", "Broadcast Active [#$idHash] Mode: $triage")
             }
-        })
+            override fun onStartFailure(errorCode: Int) {
+                Log.e("BLEMesh", "Broadcast Failed: $errorCode")
+            }
+        }
+        
+        currentAdvertiseCallback = callback
+        lastAdvertisedPayload = payload
+        adv.startAdvertising(settings, data, callback)
+    }
+
+    private fun getBeaconId(sosId: String): Int {
+        val clean = sosId.removePrefix("BEACON-")
+        return clean.toIntOrNull() ?: Math.abs(sosId.hashCode() % 100000)
     }
 
     @SuppressLint("MissingPermission")
     fun stopSosBroadcast() {
-        advertiser?.stopAdvertising(object : AdvertiseCallback() {})
+        currentAdvertiseCallback?.let {
+            advertiser?.stopAdvertising(it)
+            currentAdvertiseCallback = null
+        }
+        lastAdvertisedPayload = null
         relayedIds.clear()
+        if (isBurstMode) {
+            isBurstMode = false
+            restartScanningWithHighPriority()
+        }
     }
     
     fun updateNearbyNodeCount(count: Int) {
         this.nearbyNodeCount = count
+    }
+
+    private fun restartScanningWithHighPriority() {
+        if (isScanning) {
+            stopScanningInternal()
+            startMeshScanning()
+        }
+    }
+
+    @SuppressLint("MissingPermission")
+    private fun stopScanningInternal() {
+        scanner?.stopScan(mScanCallback)
+        isScanning = false
     }
 
     @SuppressLint("MissingPermission")
@@ -93,37 +148,49 @@ class BLEManager(private val context: Context) {
             .build()
 
         val settings = ScanSettings.Builder()
-            .setScanMode(ScanSettings.SCAN_MODE_LOW_LATENCY)
+            // In burst mode (active SOS), use LOW_LATENCY (continuous scanning)
+            .setScanMode(if (isBurstMode) ScanSettings.SCAN_MODE_LOW_LATENCY else ScanSettings.SCAN_MODE_BALANCED)
             .setCallbackType(ScanSettings.CALLBACK_TYPE_ALL_MATCHES)
             .setMatchMode(ScanSettings.MATCH_MODE_AGGRESSIVE)
             .build()
 
-        scn.startScan(listOf(filter), settings, object : ScanCallback() {
-            override fun onScanResult(callbackType: Int, result: ScanResult?) {
-                result?.scanRecord?.getManufacturerSpecificData(MESH_MANUFACTURER_ID)?.let { data ->
-                    try {
-                        if (data.size < 26) return@let
-                        
-                        val buffer = ByteBuffer.wrap(data)
-                        val header = ByteArray(4)
-                        buffer.get(header)
-                        
-                        val idHash = buffer.int
-                        val lat = buffer.double
-                        val lon = buffer.double
-                        val triageByte = buffer.get()
-                        val vCount = buffer.get().toInt()
-                        
-                        val triage = when(triageByte.toInt()) {
-                            3 -> "CRITICAL"
-                            2 -> "SERIOUS"
-                            else -> "STABLE"
-                        }
-                        
-                        onSosDetected?.invoke("BEACON-$idHash", lat, lon, triage, vCount)
-                    } catch (e: Exception) { }
-                }
+        scn.startScan(listOf(filter), settings, mScanCallback)
+    }
+
+    private val mScanCallback = object : ScanCallback() {
+        override fun onScanResult(callbackType: Int, result: ScanResult?) {
+            result?.scanRecord?.getManufacturerSpecificData(MESH_MANUFACTURER_ID)?.let { data ->
+                try {
+                    if (data.size < 27) return@let
+                    
+                    val buffer = ByteBuffer.wrap(data)
+                    val headerBytes = ByteArray(4)
+                    buffer.get(headerBytes)
+                    
+                    if (!headerBytes.contentEquals(MESH_HEADER)) return@let
+                    
+                    val idHash = buffer.int
+                    val lat = buffer.double
+                    val lon = buffer.double
+                    val triageByte = buffer.get()
+                    val vCount = buffer.get().toInt()
+                    val receivedChecksum = buffer.get()
+                    
+                    val calculatedChecksum = (idHash % 100 + lat.toInt() % 100 + lon.toInt() % 100 + triageByte + vCount).toByte()
+                    if (receivedChecksum != calculatedChecksum) return@let
+                    
+                    if (lat == 0.0 || lon == 0.0 || lat < -90 || lat > 90) return@let
+                    
+                    val triage = when(triageByte.toInt()) {
+                        4 -> "RESOLVED"
+                        3 -> "CRITICAL"
+                        2 -> "SERIOUS"
+                        else -> "STABLE"
+                    }
+                    
+                    onSosDetected?.invoke("BEACON-$idHash", lat, lon, triage, vCount)
+                } catch (e: Exception) { }
             }
-        })
+        }
     }
 }
